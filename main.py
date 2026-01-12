@@ -430,6 +430,33 @@ async def status(interaction: discord.Interaction, project_name: str):
     else:
         await interaction.followup.send(f"❌ Project **{project_name}** not found or empty.")
 
+# --- HELP COMMAND ---
+
+@bot.tree.command(name="help", description="Show guide on how to use this bot")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="📦 Logistics Bot Guide", description="Here are the available commands:", color=discord.Color.teal())
+    
+    embed.add_field(name="👤 For Members", value="""
+    `/update_stock` - Paste your full inventory list.
+    `/deposit_item` - Add items (e.g., +50 Scrap).
+    `/withdraw_item` - Remove items (e.g., -10 Iron).
+    `/my_stock` - View your personal stash.
+    """, inline=False)
+    
+    embed.add_field(name="👮 For Officers", value="""
+    `/status` - Check project progress.
+    `/locate` - Find who has a specific item.
+    `/production` - Check crafting potential (e.g. Quantanium -> Polaris Bits).
+    """, inline=False)
+    
+    embed.add_field(name="🛠️ For Admins", value="""
+    `/project_create` - Start a new project.
+    `/project_add_item` - Add requirements.
+    `/dashboard_set` - Create the Live Dashboard.
+    """, inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 # --- DASHBOARD ENGINE ---
 
 async def build_dashboard_embed(project_name):
