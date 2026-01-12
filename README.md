@@ -92,6 +92,7 @@ Unlike standard MMO guild banks, this bot manages a **Distributed Warehouse**: i
 ### Step 4: Configuration
 
 Create a file named `.env` in the root folder and fill in your details:
+
     ```powershell
     DISCORD_TOKEN=your_discord_bot_token_here
     DATABASE_URL=postgresql://postgres.yourproject:password@aws-0-us-east-1.pooler.supabase.com:5432/postgres
