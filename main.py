@@ -461,6 +461,7 @@ async def help_command(interaction: discord.Interaction):
 
 async def build_dashboard_embed(project_name):
     async with pool.acquire() as conn:
+        # 1. Fetch all requirements for this project
         reqs = await conn.fetch("""
             SELECT pr.item_name, pr.target_amount 
             FROM project_requirements pr
@@ -470,13 +471,20 @@ async def build_dashboard_embed(project_name):
         
         if not reqs: return None
 
+        # 2. OPTIMIZATION: Create a lookup map { "MG Scripts": 50, ... }
+        # This lets us instantly check if an ingredient is also a direct requirement
+        requirements_map = {row['item_name']: row['target_amount'] for row in reqs}
+
         embed = discord.Embed(title=f"🚀 Project Status: {project_name}", color=discord.Color.blue())
         
         for req in reqs:
             item = req['item_name']
             target = req['target_amount']
+            
+            # Get Direct Stock (Finished items)
             direct = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", item)
             
+            # Get Potential Stock (Calculated from Surplus Ingredients)
             recipe = await conn.fetchrow("SELECT input_item_name, quantity_required FROM recipes WHERE output_item_name = $1", item)
             potential = 0
             input_item_name = None
@@ -484,9 +492,22 @@ async def build_dashboard_embed(project_name):
             if recipe:
                 input_item_name = recipe['input_item_name']
                 ratio = recipe['quantity_required']
+                
+                # A. How much of the raw material do we have TOTAL?
                 raw_total = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
-                potential = raw_total // ratio
+                
+                # B. Does the project ITSELF need this raw material directly?
+                # (e.g. Idris needs MG Scripts directly AND Wikelo Favors which are made of MG Scripts)
+                raw_needed_directly = requirements_map.get(input_item_name, 0)
+                
+                # C. Calculate Surplus: (Total Raw) - (Reserved for Direct Requirement)
+                # If we have 120 MG Scripts, and Project needs 50, Surplus is 70.
+                surplus_raw = max(0, raw_total - raw_needed_directly)
+                
+                # D. Calculate potential from surplus only
+                potential = surplus_raw // ratio
             
+            # --- Visuals ---
             total_ready = direct + potential
             percent = min(100, int((total_ready / target) * 100))
             
@@ -500,9 +521,15 @@ async def build_dashboard_embed(project_name):
             
             status_text = f"`{bar}` **{percent}%**\n"
             status_text += f"• **Ready:** {direct} / {target}\n"
+            
             if potential > 0:
-                status_text += f"• **Potential:** {potential} (from {input_item_name})\n"
-                
+                status_text += f"• **Potential:** +{potential} (Craftable from {surplus_raw} excess {input_item_name})\n"
+            elif recipe and potential == 0:
+                 # Optional: Show why it's 0 if we have raw materials but they are all reserved
+                 raw_total_debug = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
+                 if raw_total_debug > 0:
+                     status_text += f"• *Raw materials reserved for other requirements*\n"
+
             embed.add_field(name=item, value=status_text, inline=False)
             
         embed.set_footer(text="Use /update_stock to contribute • ▓ = Ready, ▒ = Craftable")
