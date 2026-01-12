@@ -36,3 +36,11 @@ CREATE TABLE user_inventory (
     last_updated TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (user_id, item_name)
 );
+
+-- 6. Server Configuration (e.g., which channel to post updates in)
+CREATE TABLE IF NOT EXISTS server_config (
+    guild_id BIGINT PRIMARY KEY,
+    dashboard_channel_id BIGINT,
+    dashboard_message_id BIGINT,
+    active_project_id INT REFERENCES projects(id)
+);

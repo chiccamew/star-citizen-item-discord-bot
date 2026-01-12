@@ -34,8 +34,14 @@ pool = None
 async def init_db_pool():
     global pool
     if pool is None:
-        # Create a pool of connections (min 1, max 10)
-        pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
+        # statement_cache_size=0 tells asyncpg NOT to cache queries
+        # This is REQUIRED for Supabase/PgBouncer
+        pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL, 
+            min_size=1, 
+            max_size=10, 
+            statement_cache_size=0
+        )
 
 async def item_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     """Suggests items from the database as you type."""
@@ -59,6 +65,43 @@ async def project_autocomplete(interaction: discord.Interaction, current: str) -
         return []
 
 # --- MODAL: BULK UPDATE ---
+async def update_dashboard_message(guild, project_name_hint=None):
+    """
+    Refreshes the pinned dashboard message.
+    Note: We ignore 'project_name_hint' and fetch the *Active* project from DB to be safe.
+    """
+    async with pool.acquire() as conn:
+        # 1. Get the saved config
+        config = await conn.fetchrow("""
+            SELECT sc.dashboard_channel_id, sc.dashboard_message_id, p.name as project_name
+            FROM server_config sc
+            JOIN projects p ON sc.active_project_id = p.id
+            WHERE sc.guild_id = $1
+        """, guild.id)
+        
+        if not config:
+            return # No dashboard set up yet
+
+        channel_id = config['dashboard_channel_id']
+        message_id = config['dashboard_message_id']
+        active_project = config['project_name']
+
+    # 2. Get the Channel and Message objects
+    channel = guild.get_channel(channel_id)
+    if not channel: return
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return # Message was deleted by a user
+
+    # 3. Build new Embed data
+    new_embed = await build_dashboard_embed(active_project)
+    
+    # 4. Edit the message
+    if new_embed:
+        await message.edit(embed=new_embed)
+
 class InventoryModal(ui.Modal, title="Update Inventory"):
     inventory_input = ui.TextInput(
         label="Paste Inventory (Format: Item: Qty)",
@@ -103,6 +146,7 @@ class InventoryModal(ui.Modal, title="Update Inventory"):
             msg += "\n⚠️ **Errors:**\n" + "\n".join(errors[:5])
             
         await interaction.followup.send(msg, ephemeral=True)
+        await update_dashboard_message(interaction.guild)
         # Check if active project exists before trying to update dashboard (Optional)
         # await update_dashboard_message(interaction.guild, "Operation Idris")
 
@@ -153,7 +197,137 @@ async def recipe_add(interaction: discord.Interaction, output_item: str, input_i
     
     await interaction.response.send_message(f"✅ Recipe Saved: **{ratio} {input_item}** = 1 **{output_item}**", ephemeral=True)
 
+@bot.tree.command(name="dashboard_set", description="Create/Reset the Live Dashboard for a specific project")
+@app_commands.autocomplete(project_name=project_autocomplete)
+async def dashboard_set(interaction: discord.Interaction, project_name: str):
+    # 1. DEFER IMMEDIATELY (Buys us 15 minutes)
+    await interaction.response.defer(ephemeral=True)
+
+    # 2. Verify Project Exists
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT id FROM projects WHERE name = $1", project_name)
+        if not project:
+            # Use followup instead of response
+            await interaction.followup.send(f"❌ Project **{project_name}** not found.", ephemeral=True)
+            return
+        
+        # 3. Build the initial Embed
+        embed = await build_dashboard_embed(project_name)
+        if not embed:
+             await interaction.followup.send(f"❌ Project **{project_name}** has no requirements yet.", ephemeral=True)
+             return
+
+        # 4. Send the new Dashboard Message
+        msg = await interaction.channel.send(embed=embed)
+        
+        # 5. Pin it
+        try: await msg.pin()
+        except: pass
+
+        # 6. Save to DB
+        await conn.execute("""
+            INSERT INTO server_config (guild_id, dashboard_channel_id, dashboard_message_id, active_project_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (guild_id) 
+            DO UPDATE SET 
+                dashboard_channel_id = $2,
+                dashboard_message_id = $3,
+                active_project_id = $4
+        """, interaction.guild.id, interaction.channel.id, msg.id, project['id'])
+
+    # 7. Final Success Message (Use followup)
+    await interaction.followup.send(f"✅ Dashboard set to **{project_name}**. It will auto-update.", ephemeral=True)
+
 # --- COMMANDS: USER TOOLS ---
+
+@bot.tree.command(name="deposit_item", description="Add items to your current stash (e.g. +50 Scrap)")
+@app_commands.autocomplete(item_name=item_autocomplete)
+async def deposit_item(interaction: discord.Interaction, item_name: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    async with pool.acquire() as conn:
+        # 1. Ensure item exists in DB registry
+        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+        
+        # 2. Add to existing quantity (Upsert)
+        await conn.execute("""
+            INSERT INTO user_inventory (user_id, item_name, quantity)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, item_name) 
+            DO UPDATE SET quantity = user_inventory.quantity + $3, last_updated = NOW()
+        """, interaction.user.id, item_name, amount)
+        
+        # 3. Get new total for confirmation
+        new_total = await conn.fetchval(
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
+            interaction.user.id, item_name
+        )
+
+    await interaction.response.send_message(f"✅ Deposited **{amount}** {item_name}. New Total: **{new_total}**", ephemeral=True)
+    await update_dashboard_message(interaction.guild)
+
+@bot.tree.command(name="withdraw_item", description="Remove items from your stash (e.g. -50 Scrap)")
+@app_commands.autocomplete(item_name=item_autocomplete)
+async def withdraw_item(interaction: discord.Interaction, item_name: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    async with pool.acquire() as conn:
+        # 1. Check current balance
+        current_qty = await conn.fetchval("""
+            SELECT quantity FROM user_inventory 
+            WHERE user_id = $1 AND item_name = $2
+        """, interaction.user.id, item_name)
+        
+        if current_qty is None or current_qty < amount:
+            await interaction.response.send_message(
+                f"❌ You can't withdraw {amount}. You only have **{current_qty or 0}** {item_name}.", 
+                ephemeral=True
+            )
+            return
+
+        # 2. Perform withdrawal
+        new_total = current_qty - amount
+        if new_total == 0:
+            # Optional: Delete row if 0 to keep DB clean, or just set to 0
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", interaction.user.id, item_name)
+        else:
+            await conn.execute("""
+                UPDATE user_inventory SET quantity = $3, last_updated = NOW()
+                WHERE user_id = $1 AND item_name = $2
+            """, interaction.user.id, item_name, new_total)
+
+    await interaction.response.send_message(f"📉 Withdrew **{amount}** {item_name}. Remaining: **{new_total}**", ephemeral=True)
+    await update_dashboard_message(interaction.guild)
+
+@bot.tree.command(name="modify_item_qty", description="Set your EXACT stock (Overwrite old value)")
+@app_commands.autocomplete(item_name=item_autocomplete)
+async def modify_item_qty(interaction: discord.Interaction, item_name: str, quantity: int):
+    if quantity < 0:
+        await interaction.response.send_message("❌ Quantity cannot be negative.", ephemeral=True)
+        return
+
+    async with pool.acquire() as conn:
+        # 1. Ensure item exists
+        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+
+        if quantity == 0:
+            # If setting to 0, just delete the row
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", interaction.user.id, item_name)
+        else:
+            # Upsert (Overwrite mode)
+            await conn.execute("""
+                INSERT INTO user_inventory (user_id, item_name, quantity)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, item_name) 
+                DO UPDATE SET quantity = $3, last_updated = NOW()
+            """, interaction.user.id, item_name, quantity)
+
+    await interaction.response.send_message(f"✏️ Updated **{item_name}** to exactly **{quantity}**.", ephemeral=True)
+    await update_dashboard_message(interaction.guild)
 
 @bot.tree.command(name="update_stock", description="Open the bulk inventory update form")
 async def update_stock(interaction: discord.Interaction):
