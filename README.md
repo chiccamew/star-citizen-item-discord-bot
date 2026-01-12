@@ -91,10 +91,45 @@ Unlike standard MMO guild banks, this bot manages a **Distributed Warehouse**: i
 
 ### Step 4: Configuration
 
-Create a file named .env in the root folder and fill in your details:
-    ```Ini, TOML
+Create a file named `.env` in the root folder and fill in your details:
+    ```powershell
     DISCORD_TOKEN=your_discord_bot_token_here
     DATABASE_URL=postgresql://postgres.yourproject:password@aws-0-us-east-1.pooler.supabase.com:5432/postgres
     WAREHOUSE_CHANNEL_ID=123456789012345678
     GUILD_ID=123456789012345678
 
+* Tip: You can get IDs in Discord by enabling Developer Mode (User Settings -> Advanced) and right-clicking the Channel/Server name -> Copy ID.
+
+### Step 5: Run the Bot
+
+With your virtual environment active, run:
+    ```powershell
+    python main.py
+
+If successful, you will see:
+
+Logged in as SCLogistic#1234 Database Pool Established Commands synced to Guild ID: ...
+
+---
+
+## 🚑 Troubleshooting
+
+* **Error:** `prepared statement "..." already exists`
+
+    * Cause: Supabase uses PgBouncer in transaction mode, which doesn't support prepared statements.
+
+    * Fix: Ensure your asyncpg.create_pool call includes statement_cache_size=0. (This is included in the current main.py).
+
+* **Error:** `Unknown interaction`
+
+    * Cause: The database query took longer than 3 seconds, causing Discord to time out.
+
+    * Fix: The code uses await interaction.response.defer() to handle long queries. Ensure you aren't removing these lines when modifying commands.
+
+* **Autocomplete not working?**
+
+    * Make sure there is data in the items table.
+
+    * Try typing at least one letter.
+
+    * If the database connection is slow, the first attempt might fail. The bot uses a Connection Pool to keep this fast.
