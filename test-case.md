@@ -1,6 +1,6 @@
 ## copy and paste these lines one by one
 ### Create project
-/project_create name:WikeloIdris
+    /project_create name:WikeloIdris
 
 ## Set Project Requirement
     /project_add_item project_name:WikeloIdris item_name:Wikelo Favor amount:50
