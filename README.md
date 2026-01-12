@@ -83,7 +83,7 @@ Unlike standard MMO guild banks, this bot manages a **Distributed Warehouse**: i
     ```powershell
    .\venv\Scripts\Activate.ps1
     
-    (If you get a permission error, run Set-ExecutionPolicy Unrestricted -Scope Process first).
+(If you get a permission error, run Set-ExecutionPolicy Unrestricted -Scope Process first).
 
 5. Install Dependencies:
     ```powershell
