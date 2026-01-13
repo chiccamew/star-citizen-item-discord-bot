@@ -15,8 +15,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 try:
     WAREHOUSE_CHANNEL_ID = int(os.getenv("WAREHOUSE_CHANNEL_ID"))
     GUILD_ID = int(os.getenv("GUILD_ID"))
+    OFFICER_ROLE_ID = int(os.getenv("OFFICER_ROLE_ID")) # <--- Loaded from .env
 except (TypeError, ValueError):
-    print("❌ ERROR: WAREHOUSE_CHANNEL_ID or GUILD_ID is missing in .env")
+    print("❌ ERROR: One of the ID variables (WAREHOUSE, GUILD, OFFICER) is missing or invalid in .env")
     exit(1)
 
 MY_GUILD = discord.Object(id=GUILD_ID)
@@ -29,6 +30,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Global Database Pool
 pool = None
+
+# --- PERMISSION CHECKS ---
+def is_officer():
+    """
+    Custom check: User must have 'Administrator' permission 
+    OR have the specific OFFICER_ROLE_ID
+    """
+    def predicate(interaction: discord.Interaction) -> bool:
+        # 1. Allow Server Admins always
+        if interaction.user.guild_permissions.administrator:
+            return True
+            
+        # 2. Check for Role ID
+        return any(role.id == OFFICER_ROLE_ID for role in interaction.user.roles)
+        
+    return app_commands.check(predicate)
 
 # --- DATABASE HELPERS ---
 async def init_db_pool():
@@ -102,6 +119,8 @@ async def update_dashboard_message(guild, project_name_hint=None):
     if new_embed:
         await message.edit(embed=new_embed)
 
+# --- MODALS ---
+
 class InventoryModal(ui.Modal, title="Update Inventory"):
     inventory_input = ui.TextInput(
         label="Paste Inventory (Format: Item: Qty)",
@@ -150,10 +169,95 @@ class InventoryModal(ui.Modal, title="Update Inventory"):
         # Check if active project exists before trying to update dashboard (Optional)
         # await update_dashboard_message(interaction.guild, "Operation Idris")
 
-# --- COMMANDS: SETUP & ADMIN ---
+class WipeConfirmModal(ui.Modal, title="⚠️ CONFIRM WIPE"):
+    confirmation = ui.TextInput(
+        label="Type 'DELETE EVERYTHING' to confirm",
+        style=discord.TextStyle.short,
+        placeholder="DELETE EVERYTHING",
+        required=True,
+        max_length=20
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirmation.value != "DELETE EVERYTHING":
+            await interaction.response.send_message("❌ Confirmation failed. Operation cancelled.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        async with pool.acquire() as conn:
+            # We wipe ONLY the inventory, keeping recipes/projects intact
+            await conn.execute("TRUNCATE TABLE user_inventory")
+            
+        await interaction.followup.send("💥 **System Wiped.** All user inventories have been cleared.", ephemeral=True)
+        await update_dashboard_message(interaction.guild)
+
+# --- MODAL FOR PROJECT BULK EDIT ---
+class ProjectRequirementModal(ui.Modal, title="Bulk Edit Requirements"):
+    # We need to know which project to edit. Since Modals can't take arguments directly 
+    # from the command triggering them easily without subclassing, we pass it in __init__.
+    
+    def __init__(self, project_id, project_name):
+        super().__init__()
+        self.project_id = project_id
+        self.project_name = project_name
+        
+    requirements_input = ui.TextInput(
+        label="Paste Requirements (Format: Item: Qty)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Scrap: 5000\nGold: 200",
+        required=True,
+        max_length=3000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        data = self.requirements_input.value
+        lines = data.split('\n')
+        updated_count = 0
+        errors = []
+
+        async with pool.acquire() as conn:
+            for line in lines:
+                if ":" in line:
+                    try:
+                        name_part, qty_part = line.split(":", 1)
+                        item_name = name_part.strip()
+                        target_qty = int(qty_part.strip().replace(',', ''))
+
+                        # 1. Ensure item exists
+                        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+
+                        # 2. Upsert Requirement
+                        await conn.execute("""
+                            INSERT INTO project_requirements (project_id, item_name, target_amount)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (project_id, item_name) 
+                            DO UPDATE SET target_amount = $3
+                        """, self.project_id, item_name, target_qty)
+                        
+                        updated_count += 1
+                    except Exception as e:
+                        errors.append(f"Failed line '{line}': {e}")
+
+        msg = f"✅ **Success:** Updated {updated_count} requirements for **{self.project_name}**."
+        if errors:
+            msg += "\n⚠️ **Errors:**\n" + "\n".join(errors[:5])
+            
+        await interaction.followup.send(msg, ephemeral=True)
+        await update_dashboard_message(interaction.guild)
+
+# --- COMMANDS: ADMIN & LOGISTICS (PROTECTED) ---
+
+@bot.tree.command(name="wipe_all_user_stock", description="⚠️ NUCLEAR: Delete ALL user inventory data")
+@is_officer() # <--- PROTECTED
+async def wipe_all_user_stock(interaction: discord.Interaction):
+    await interaction.response.send_modal(WipeConfirmModal())
 
 @bot.tree.command(name="project_create", description="Start a new collection project")
 @app_commands.describe(name="Name of the project (e.g. Operation Idris)")
+@is_officer() # <--- PROTECTED
 async def project_create(interaction: discord.Interaction, name: str):
     try:
         async with pool.acquire() as conn:
@@ -164,6 +268,7 @@ async def project_create(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(name="project_add_item", description="Add a requirement to a project")
 @app_commands.autocomplete(item_name=item_autocomplete, project_name=project_autocomplete)
+@is_officer() # <--- PROTECTED
 async def project_add_item(interaction: discord.Interaction, project_name: str, item_name: str, amount: int):
     async with pool.acquire() as conn:
         project_row = await conn.fetchrow("SELECT id FROM projects WHERE name = $1", project_name)
@@ -183,8 +288,59 @@ async def project_add_item(interaction: discord.Interaction, project_name: str, 
     
     await interaction.response.send_message(f"✅ Added **{amount}x {item_name}** to {project_name}.", ephemeral=True)
 
+@bot.tree.command(name="project_item_export", description="Get a copy-paste list of current project requirements")
+@app_commands.autocomplete(project_name=project_autocomplete)
+@is_officer()
+async def project_item_export(interaction: discord.Interaction, project_name: str):
+    async with pool.acquire() as conn:
+        # Verify project exists
+        project = await conn.fetchrow("SELECT id FROM projects WHERE name = $1", project_name)
+        if not project:
+            await interaction.response.send_message(f"❌ Project **{project_name}** not found.", ephemeral=True)
+            return
+
+        rows = await conn.fetch("""
+            SELECT item_name, target_amount 
+            FROM project_requirements 
+            WHERE project_id = $1 
+            ORDER BY item_name
+        """, project['id'])
+
+    if not rows:
+        await interaction.response.send_message(f"⚠️ Project **{project_name}** has no requirements yet.", ephemeral=True)
+        return
+
+    # Format specifically for the Bulk Edit modal
+    export_text = ""
+    for row in rows:
+        export_text += f"{row['item_name']}: {row['target_amount']}\n"
+    
+    # Send inside a code block for easy copying
+    await interaction.response.send_message(
+        f"📋 **Export for {project_name}:**\nCopy the block below used in `/project_item_bulk_edit`", 
+        ephemeral=True
+    )
+    await interaction.followup.send(f"```{export_text}```", ephemeral=True)
+
+
+@bot.tree.command(name="project_item_bulk_edit", description="Bulk update/overwrite project requirements")
+@app_commands.autocomplete(project_name=project_autocomplete)
+@is_officer()
+async def project_item_bulk_edit(interaction: discord.Interaction, project_name: str):
+    # We need to fetch the ID first to pass it to the Modal
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT id FROM projects WHERE name = $1", project_name)
+    
+    if not project:
+        await interaction.response.send_message(f"❌ Project **{project_name}** not found.", ephemeral=True)
+        return
+
+    # Pass ID and Name to the Modal
+    await interaction.response.send_modal(ProjectRequirementModal(project_id=project['id'], project_name=project_name))
+
 @bot.tree.command(name="recipe_add", description="Define how an item is crafted")
 @app_commands.autocomplete(output_item=item_autocomplete, input_item=item_autocomplete)
+@is_officer() # <--- PROTECTED
 async def recipe_add(interaction: discord.Interaction, output_item: str, input_item: str, ratio: int):
     async with pool.acquire() as conn:
         await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", output_item)
@@ -199,6 +355,7 @@ async def recipe_add(interaction: discord.Interaction, output_item: str, input_i
 
 @bot.tree.command(name="dashboard_set", description="Create/Reset the Live Dashboard for a specific project")
 @app_commands.autocomplete(project_name=project_autocomplete)
+@is_officer() # <--- PROTECTED
 async def dashboard_set(interaction: discord.Interaction, project_name: str):
     # 1. DEFER IMMEDIATELY (Buys us 15 minutes)
     await interaction.response.defer(ephemeral=True)
@@ -238,7 +395,7 @@ async def dashboard_set(interaction: discord.Interaction, project_name: str):
     # 7. Final Success Message (Use followup)
     await interaction.followup.send(f"✅ Dashboard set to **{project_name}**. It will auto-update.", ephemeral=True)
 
-# --- COMMANDS: USER TOOLS ---
+# --- COMMANDS: USER TOOLS (PUBLIC) ---
 
 @bot.tree.command(name="deposit_item", description="Add items to your current stash (e.g. +50 Scrap)")
 @app_commands.autocomplete(item_name=item_autocomplete)
@@ -347,7 +504,33 @@ async def my_stock(interaction: discord.Interaction):
         text += f"• {row['item_name']}: {row['quantity']}\n"
     await interaction.response.send_message(text, ephemeral=True)
 
-# --- COMMANDS: LOGISTICS & OFFICERS ---
+@bot.tree.command(name="my_stock_export", description="Get your current inventory in copy-paste format")
+async def my_stock_export(interaction: discord.Interaction):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT item_name, quantity 
+            FROM user_inventory 
+            WHERE user_id = $1 AND quantity > 0 
+            ORDER BY item_name
+        """, interaction.user.id)
+    
+    if not rows:
+        await interaction.response.send_message("You have no items registered.", ephemeral=True)
+        return
+
+    export_text = ""
+    for row in rows:
+        export_text += f"{row['item_name']}: {row['quantity']}\n"
+
+    await interaction.response.send_message(
+        "📋 **Your Inventory Export:**\nCopy the block below to use in `/update_stock` or save as backup.", 
+        ephemeral=True
+    )
+    await interaction.followup.send(f"```{export_text}```", ephemeral=True)
+
+# --- COMMANDS: LOGISTICS & OFFICERS (PUBLIC) ---
+# Note: Locate/Production/Status are public info, but you can protect them if you wish.
+# Currently they are open to everyone.
 
 @bot.tree.command(name="locate", description="Find who is holding a specific item")
 @app_commands.autocomplete(item_name=item_autocomplete)
@@ -432,6 +615,8 @@ async def status(interaction: discord.Interaction, project_name: str):
 
 # --- HELP COMMAND ---
 
+# --- HELP COMMAND ---
+
 @bot.tree.command(name="help", description="Show guide on how to use this bot")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="📦 Logistics Bot Guide", description="Here are the available commands:", color=discord.Color.teal())
@@ -441,6 +626,7 @@ async def help_command(interaction: discord.Interaction):
     `/deposit_item` - Add items (e.g., +50 Scrap).
     `/withdraw_item` - Remove items (e.g., -10 Iron).
     `/my_stock` - View your personal stash.
+    `/my_stock_export` - Get a copy-paste list of your stash.
     """, inline=False)
     
     embed.add_field(name="👮 For Officers", value="""
@@ -449,10 +635,13 @@ async def help_command(interaction: discord.Interaction):
     `/production` - Check crafting potential (e.g. Quantanium -> Polaris Bits).
     """, inline=False)
     
-    embed.add_field(name="🛠️ For Admins", value="""
+    embed.add_field(name="🛠️ For Admins & Project Managers", value="""
     `/project_create` - Start a new project.
-    `/project_add_item` - Add requirements.
+    `/project_add_item` - Add single requirement.
+    `/project_item_export` - Copy full project requirements.
+    `/project_item_bulk_edit` - Mass edit requirements.
     `/dashboard_set` - Create the Live Dashboard.
+    `/wipe_all_user_stock` - ⚠️ Delete all user inventory.
     """, inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -534,6 +723,17 @@ async def build_dashboard_embed(project_name):
             
         embed.set_footer(text="Use /update_stock to contribute • ▓ = Ready, ▒ = Craftable")
         return embed
+
+# --- ERROR HANDLER ---
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("⛔ **Access Denied:** You need the 'Logistics Officer' role to use this.", ephemeral=True)
+    else:
+        print(f"Command Error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ An internal error occurred.", ephemeral=True)
 
 @bot.event
 async def on_ready():

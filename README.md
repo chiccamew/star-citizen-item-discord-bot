@@ -26,6 +26,8 @@ Unlike standard MMO guild banks, this bot manages a **Distributed Warehouse**: i
   Remove items (e.g., if you sold them or got pirated).
 * **`/my_stock`** 🎒
   View your current personal balance recorded in the system.
+* **`/my_stock_export`** 📋
+  Get a copy-paste list of your current inventory to back it up or use in edits.
 
 ### For Logistics Officers
 * **`/status [project]`** 📊
@@ -36,15 +38,21 @@ Unlike standard MMO guild banks, this bot manages a **Distributed Warehouse**: i
   Checks if you have enough raw materials to craft a missing item.
   * *Example:* You need "Polaris Bits." The bot checks who has "Quantanium."
 
-### For Admins
+### For Admins & Project Managers
 * **`/project_create [name]`**
   Initialize a new goal (e.g., "Operation Idris").
 * **`/project_add_item [project] [item] [amount]`**
-  Add a requirement to the project.
+  Add a single requirement to the project.
+* **`/project_item_export [project]`** 📤
+  Get a raw list of all project requirements (useful for backups or bulk edits).
+* **`/project_item_bulk_edit [project]`** ✏️
+  Open a form to mass-edit or overwrite project requirements using a list.
 * **`/recipe_add [output] [input] [ratio]`**
   Define crafting rules (e.g., 24 Quantanium → 1 Polaris Bit).
 * **`/dashboard_set [project]`** 📌
   Creates (or moves) the **Live Dashboard** to the current channel and pins it.
+* **`/wipe_all_user_stock`** ☢️
+  **Nuclear Option:** Deletes ALL user inventory data. Requires confirmation.
 
 ---
 
@@ -97,8 +105,11 @@ Create a file named `.env` in the root folder and fill in your details:
     DATABASE_URL=postgresql://postgres.yourproject:password@aws-0-us-east-1.pooler.supabase.com:5432/postgres
     WAREHOUSE_CHANNEL_ID=123456789012345678
     GUILD_ID=123456789012345678
+    OFFICER_ROLE_ID=123456789012345678
 
-* Tip: You can get IDs in Discord by enabling Developer Mode (User Settings -> Advanced) and right-clicking the Channel/Server name -> Copy ID.
+* **Tip:** You can get IDs in Discord by enabling Developer Mode (User Settings -> Advanced) and right-clicking the Channel/Server name -> Copy ID.
+
+* **Note:** OFFICER_ROLE_ID is the ID of the role allowed to manage projects and use admin commands.
 
 ### Step 5: Run the Bot
 
