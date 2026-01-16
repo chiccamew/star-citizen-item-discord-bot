@@ -395,6 +395,86 @@ async def dashboard_set(interaction: discord.Interaction, project_name: str):
     # 7. Final Success Message (Use followup)
     await interaction.followup.send(f"✅ Dashboard set to **{project_name}**. It will auto-update.", ephemeral=True)
 
+@bot.tree.command(name="admin_deposit", description="👮 Give items TO another user's inventory")
+@app_commands.describe(target_user="Who gets the items?", item_name="Which item?", amount="How many?")
+@app_commands.autocomplete(item_name=item_autocomplete)
+@is_officer()
+async def admin_deposit(interaction: discord.Interaction, target_user: discord.Member, item_name: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    async with pool.acquire() as conn:
+        # 1. Ensure item exists
+        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+        
+        # 2. Add to TARGET USER'S stock (using target_user.id)
+        await conn.execute("""
+            INSERT INTO user_inventory (user_id, item_name, quantity)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, item_name) 
+            DO UPDATE SET quantity = user_inventory.quantity + $3, last_updated = NOW()
+        """, target_user.id, item_name, amount)
+        
+        # 3. Get new personal total for that user
+        new_personal = await conn.fetchval(
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
+            target_user.id, item_name
+        )
+        
+        # 4. Get Global Total
+        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", item_name)
+
+    # 5. Public Announcement
+    await interaction.response.send_message(
+        f"👮 **Admin Action:** Deposited **{amount}** {item_name} into {target_user.mention}'s stash.\n"
+        f"👤 **Their Total:** {new_personal}\n"
+        f"🌍 **Global Stock:** {global_total}"
+    )
+    await update_dashboard_message(interaction.guild)
+
+@bot.tree.command(name="admin_withdraw", description="👮 Remove items FROM another user's inventory")
+@app_commands.describe(target_user="Who loses the items?", item_name="Which item?", amount="How many?")
+@app_commands.autocomplete(item_name=item_autocomplete)
+@is_officer()
+async def admin_withdraw(interaction: discord.Interaction, target_user: discord.Member, item_name: str, amount: int):
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
+        return
+
+    async with pool.acquire() as conn:
+        # 1. Check target's current balance
+        current_qty = await conn.fetchval("""
+            SELECT quantity FROM user_inventory 
+            WHERE user_id = $1 AND item_name = $2
+        """, target_user.id, item_name)
+        
+        if current_qty is None or current_qty < amount:
+            await interaction.response.send_message(
+                f"❌ Cannot withdraw {amount}. {target_user.display_name} only has **{current_qty or 0}** {item_name}.", 
+                ephemeral=True
+            )
+            return
+
+        # 2. Perform withdrawal
+        new_personal = current_qty - amount
+        if new_personal == 0:
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", target_user.id, item_name)
+        else:
+            await conn.execute("""
+                UPDATE user_inventory SET quantity = $3, last_updated = NOW()
+                WHERE user_id = $1 AND item_name = $2
+            """, target_user.id, item_name, new_personal)
+            
+        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", item_name) or 0
+
+    await interaction.response.send_message(
+        f"👮 **Admin Action:** Withdrew **{amount}** {item_name} from {target_user.mention}.\n"
+        f"👤 **Their Remaining:** {new_personal}\n"
+        f"🌍 **Global Stock:** {global_total}"
+    )
+    await update_dashboard_message(interaction.guild)
+
 # --- COMMANDS: USER TOOLS (PUBLIC) ---
 
 @bot.tree.command(name="deposit_item", description="Add items to your current stash (e.g. +50 Scrap)")
@@ -673,6 +753,8 @@ async def help_command(interaction: discord.Interaction):
     `/project_item_bulk_edit` - Mass edit requirements.
     `/dashboard_set` - Create the Live Dashboard.
     `/wipe_all_user_stock` - ⚠️ Delete all user inventory.
+    `/admin_deposit` - Give items to a user.
+    `/admin_withdraw` - Take items from a user.
     """, inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
