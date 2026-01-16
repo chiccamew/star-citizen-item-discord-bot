@@ -160,11 +160,11 @@ class InventoryModal(ui.Modal, title="Update Inventory"):
                     except Exception as e:
                         errors.append(f"Failed line '{line}': {e}")
         
-        msg = f"✅ **Success:** Updated {updated_count} items in your ledger."
+        msg = f"✅ **Success:** **{interaction.user.display_name}** Updated {updated_count} items in their ledger."
         if errors:
             msg += "\n⚠️ **Errors:**\n" + "\n".join(errors[:5])
             
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(msg)
         await update_dashboard_message(interaction.guild)
         # Check if active project exists before trying to update dashboard (Optional)
         # await update_dashboard_message(interaction.guild, "Operation Idris")
@@ -422,7 +422,16 @@ async def deposit_item(interaction: discord.Interaction, item_name: str, amount:
             interaction.user.id, item_name
         )
 
-    await interaction.response.send_message(f"✅ Deposited **{amount}** {item_name}. New Total: **{new_total}**", ephemeral=True)
+        global_total = await conn.fetchval(
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
+            item_name
+        )
+
+    await interaction.response.send_message(
+        f"📦 **{interaction.user.display_name}** deposited **{amount}** {item_name}.\n"
+        f"📦 **{interaction.user.display_name}** Total stock: **{new_total}**.\n"
+        f"🌍 **Global Stock:** {global_total}"
+    )
     await update_dashboard_message(interaction.guild)
 
 @bot.tree.command(name="withdraw_item", description="Remove items from your stash (e.g. -50 Scrap)")
@@ -457,7 +466,16 @@ async def withdraw_item(interaction: discord.Interaction, item_name: str, amount
                 WHERE user_id = $1 AND item_name = $2
             """, interaction.user.id, item_name, new_total)
 
-    await interaction.response.send_message(f"📉 Withdrew **{amount}** {item_name}. Remaining: **{new_total}**", ephemeral=True)
+        global_total = await conn.fetchval(
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
+            item_name
+        )
+
+    await interaction.response.send_message(
+        f"� **{interaction.user.display_name}** withdrew **{amount}** {item_name}.\n"
+        f"📦 **{interaction.user.display_name}** Total stock: **{new_total}**.\n"
+        f"🌍 **Global Stock:** {global_total}"
+    )
     await update_dashboard_message(interaction.guild)
 
 @bot.tree.command(name="modify_item_qty", description="Set your EXACT stock (Overwrite old value)")
@@ -471,6 +489,11 @@ async def modify_item_qty(interaction: discord.Interaction, item_name: str, quan
         # 1. Ensure item exists
         await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
 
+        initial_total = await conn.fetchval(
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
+            interaction.user.id, item_name
+        )
+
         if quantity == 0:
             # If setting to 0, just delete the row
             await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", interaction.user.id, item_name)
@@ -483,7 +506,15 @@ async def modify_item_qty(interaction: discord.Interaction, item_name: str, quan
                 DO UPDATE SET quantity = $3, last_updated = NOW()
             """, interaction.user.id, item_name, quantity)
 
-    await interaction.response.send_message(f"✏️ Updated **{item_name}** to exactly **{quantity}**.", ephemeral=True)
+        global_total = await conn.fetchval(
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
+            item_name
+        )
+
+    await interaction.response.send_message(
+        f"� **{interaction.user.display_name}** ✏️ Updated **{item_name}** from **{initial_total}** to **{quantity}**.\n"
+        f"🌍 **Global Stock:** {global_total}"
+    )
     await update_dashboard_message(interaction.guild)
 
 @bot.tree.command(name="update_stock", description="Open the bulk inventory update form")
