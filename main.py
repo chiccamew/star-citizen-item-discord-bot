@@ -675,7 +675,7 @@ async def locate(interaction: discord.Interaction, item_name: str):
         list_text += f"• **{name}**: {qty}\n"
         
     embed.add_field(name="Top Holders", value=list_text or "None")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="production", description="Check chain of production for a crafted item")
 @app_commands.autocomplete(item_name=item_autocomplete)
