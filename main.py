@@ -774,11 +774,14 @@ async def build_dashboard_embed(project_name):
         if not reqs: return None
 
         # 2. OPTIMIZATION: Create a lookup map { "MG Scripts": 50, ... }
-        # This lets us instantly check if an ingredient is also a direct requirement
         requirements_map = {row['item_name']: row['target_amount'] for row in reqs}
 
         embed = discord.Embed(title=f"🚀 Project Status: {project_name}", color=discord.Color.blue())
         
+        # Track the project bottleneck (Lowest number of sets we can make)
+        # Start with None (infinity)
+        min_project_sets = None
+
         for req in reqs:
             item = req['item_name']
             target = req['target_amount']
@@ -799,11 +802,9 @@ async def build_dashboard_embed(project_name):
                 raw_total = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
                 
                 # B. Does the project ITSELF need this raw material directly?
-                # (e.g. Idris needs MG Scripts directly AND Wikelo Favors which are made of MG Scripts)
                 raw_needed_directly = requirements_map.get(input_item_name, 0)
                 
-                # C. Calculate Surplus: (Total Raw) - (Reserved for Direct Requirement)
-                # If we have 120 MG Scripts, and Project needs 50, Surplus is 70.
+                # C. Calculate Surplus
                 surplus_raw = max(0, raw_total - raw_needed_directly)
                 
                 # D. Calculate potential from surplus only
@@ -812,6 +813,13 @@ async def build_dashboard_embed(project_name):
             # --- Visuals ---
             total_ready = direct + potential
             percent = min(100, int((total_ready / target) * 100))
+
+            # --- Calculate Sets for this Item ---
+            # e.g., if we have 500 Scrap and need 50, we have 10 sets of Scrap.
+            if target > 0:
+                current_item_sets = total_ready // target
+                if min_project_sets is None or current_item_sets < min_project_sets:
+                    min_project_sets = current_item_sets
             
             bar_len = 12
             filled_direct = min(bar_len, int((direct / target) * bar_len))
@@ -827,14 +835,17 @@ async def build_dashboard_embed(project_name):
             if potential > 0:
                 status_text += f"• **Potential:** +{potential} (Craftable from {surplus_raw} excess {input_item_name})\n"
             elif recipe and potential == 0:
-                 # Optional: Show why it's 0 if we have raw materials but they are all reserved
                  raw_total_debug = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
                  if raw_total_debug > 0:
                      status_text += f"• *Raw materials reserved for other requirements*\n"
 
             embed.add_field(name=item, value=status_text, inline=False)
             
-        embed.set_footer(text="Use /update_stock to contribute • ▓ = Ready, ▒ = Craftable")
+        # Add the Sets Summary to the Description
+        if min_project_sets is not None:
+            embed.description = f"📦 **Available Sets:** You can complete this project **{min_project_sets}** times with current stock."
+            
+        embed.set_footer(text="Use /help to see all commands • ▓ = Ready, ▒ = Craftable")
         return embed
 
 # --- ERROR HANDLER ---
