@@ -81,7 +81,6 @@ async def project_autocomplete(interaction: discord.Interaction, current: str) -
         print(f"⚠️ Project Autocomplete Error: {e}")
         return []
 
-# --- MODAL: BULK UPDATE ---
 async def update_dashboard_message(guild, project_name_hint=None):
     """
     Refreshes the pinned dashboard message.
@@ -148,14 +147,20 @@ class InventoryModal(ui.Modal, title="Update Inventory"):
                         item_name = name_part.strip()
                         qty = int(qty_part.strip().replace(',', '')) 
 
-                        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+                        # 1. Get or Create ID
+                        item_id = await conn.fetchval("""
+                            INSERT INTO items (name) VALUES ($1) 
+                            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+                            RETURNING id
+                        """, item_name)
 
+                        # 2. Update User Stock using ID
                         await conn.execute("""
-                            INSERT INTO user_inventory (user_id, item_name, quantity)
+                            INSERT INTO user_inventory (user_id, item_id, quantity)
                             VALUES ($1, $2, $3)
-                            ON CONFLICT (user_id, item_name) 
+                            ON CONFLICT (user_id, item_id) 
                             DO UPDATE SET quantity = $3, last_updated = NOW()
-                        """, user_id, item_name, qty)
+                        """, user_id, item_id, qty)
                         updated_count += 1
                     except Exception as e:
                         errors.append(f"Failed line '{line}': {e}")
@@ -166,8 +171,6 @@ class InventoryModal(ui.Modal, title="Update Inventory"):
             
         await interaction.followup.send(msg)
         await update_dashboard_message(interaction.guild)
-        # Check if active project exists before trying to update dashboard (Optional)
-        # await update_dashboard_message(interaction.guild, "Operation Idris")
 
 class WipeConfirmModal(ui.Modal, title="⚠️ CONFIRM WIPE"):
     confirmation = ui.TextInput(
@@ -194,9 +197,6 @@ class WipeConfirmModal(ui.Modal, title="⚠️ CONFIRM WIPE"):
 
 # --- MODAL FOR PROJECT BULK EDIT ---
 class ProjectRequirementModal(ui.Modal, title="Bulk Edit Requirements"):
-    # We need to know which project to edit. Since Modals can't take arguments directly 
-    # from the command triggering them easily without subclassing, we pass it in __init__.
-    
     def __init__(self, project_id, project_name):
         super().__init__()
         self.project_id = project_id
@@ -226,16 +226,20 @@ class ProjectRequirementModal(ui.Modal, title="Bulk Edit Requirements"):
                         item_name = name_part.strip()
                         target_qty = int(qty_part.strip().replace(',', ''))
 
-                        # 1. Ensure item exists
-                        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+                        # 1. Get or Create ID
+                        item_id = await conn.fetchval("""
+                            INSERT INTO items (name) VALUES ($1) 
+                            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+                            RETURNING id
+                        """, item_name)
 
-                        # 2. Upsert Requirement
+                        # 2. Upsert Requirement using ID
                         await conn.execute("""
-                            INSERT INTO project_requirements (project_id, item_name, target_amount)
+                            INSERT INTO project_requirements (project_id, item_id, target_amount)
                             VALUES ($1, $2, $3)
-                            ON CONFLICT (project_id, item_name) 
+                            ON CONFLICT (project_id, item_id) 
                             DO UPDATE SET target_amount = $3
-                        """, self.project_id, item_name, target_qty)
+                        """, self.project_id, item_id, target_qty)
                         
                         updated_count += 1
                     except Exception as e:
@@ -278,13 +282,20 @@ async def project_add_item(interaction: discord.Interaction, project_name: str, 
             return
             
         project_id = project_row['id']
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
         
+        # 1. Get or Create Item ID
+        item_id = await conn.fetchval("""
+            INSERT INTO items (name) VALUES ($1) 
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+            RETURNING id
+        """, item_name)
+        
+        # 2. Insert using ID
         await conn.execute("""
-            INSERT INTO project_requirements (project_id, item_name, target_amount)
+            INSERT INTO project_requirements (project_id, item_id, target_amount)
             VALUES ($1, $2, $3)
-            ON CONFLICT (project_id, item_name) DO UPDATE SET target_amount = $3
-        """, project_id, item_name, amount)
+            ON CONFLICT (project_id, item_id) DO UPDATE SET target_amount = $3
+        """, project_id, item_id, amount)
     
     await interaction.response.send_message(f"✅ Added **{amount}x {item_name}** to {project_name}.", ephemeral=True)
 
@@ -299,11 +310,13 @@ async def project_item_export(interaction: discord.Interaction, project_name: st
             await interaction.response.send_message(f"❌ Project **{project_name}** not found.", ephemeral=True)
             return
 
+        # JOIN items to get the name back
         rows = await conn.fetch("""
-            SELECT item_name, target_amount 
-            FROM project_requirements 
-            WHERE project_id = $1 
-            ORDER BY item_name
+            SELECT i.name as item_name, pr.target_amount 
+            FROM project_requirements pr
+            JOIN items i ON pr.item_id = i.id
+            WHERE pr.project_id = $1 
+            ORDER BY i.name
         """, project['id'])
 
     if not rows:
@@ -321,7 +334,6 @@ async def project_item_export(interaction: discord.Interaction, project_name: st
         ephemeral=True
     )
     await interaction.followup.send(f"```{export_text}```", ephemeral=True)
-
 
 @bot.tree.command(name="project_item_bulk_edit", description="Bulk update/overwrite project requirements")
 @app_commands.autocomplete(project_name=project_autocomplete)
@@ -343,13 +355,15 @@ async def project_item_bulk_edit(interaction: discord.Interaction, project_name:
 @is_officer() # <--- PROTECTED
 async def recipe_add(interaction: discord.Interaction, output_item: str, input_item: str, ratio: int):
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", output_item)
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", input_item)
+        # 1. Get or Create IDs
+        out_id = await conn.fetchval("INSERT INTO items (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id", output_item)
+        in_id = await conn.fetchval("INSERT INTO items (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id", input_item)
         
+        # 2. Insert Recipe using IDs
         await conn.execute("""
-            INSERT INTO recipes (output_item_name, input_item_name, quantity_required)
+            INSERT INTO recipes (output_item_id, input_item_id, quantity_required)
             VALUES ($1, $2, $3)
-        """, output_item, input_item, ratio)
+        """, out_id, in_id, ratio)
     
     await interaction.response.send_message(f"✅ Recipe Saved: **{ratio} {input_item}** = 1 **{output_item}**", ephemeral=True)
 
@@ -357,14 +371,13 @@ async def recipe_add(interaction: discord.Interaction, output_item: str, input_i
 @app_commands.autocomplete(project_name=project_autocomplete)
 @is_officer() # <--- PROTECTED
 async def dashboard_set(interaction: discord.Interaction, project_name: str):
-    # 1. DEFER IMMEDIATELY (Buys us 15 minutes)
+    # 1. DEFER IMMEDIATELY
     await interaction.response.defer(ephemeral=True)
 
     # 2. Verify Project Exists
     async with pool.acquire() as conn:
         project = await conn.fetchrow("SELECT id FROM projects WHERE name = $1", project_name)
         if not project:
-            # Use followup instead of response
             await interaction.followup.send(f"❌ Project **{project_name}** not found.", ephemeral=True)
             return
         
@@ -376,12 +389,10 @@ async def dashboard_set(interaction: discord.Interaction, project_name: str):
 
         # 4. Send the new Dashboard Message
         msg = await interaction.channel.send(embed=embed)
-        
-        # 5. Pin it
         try: await msg.pin()
         except: pass
 
-        # 6. Save to DB
+        # 5. Save to DB
         await conn.execute("""
             INSERT INTO server_config (guild_id, dashboard_channel_id, dashboard_message_id, active_project_id)
             VALUES ($1, $2, $3, $4)
@@ -392,7 +403,6 @@ async def dashboard_set(interaction: discord.Interaction, project_name: str):
                 active_project_id = $4
         """, interaction.guild.id, interaction.channel.id, msg.id, project['id'])
 
-    # 7. Final Success Message (Use followup)
     await interaction.followup.send(f"✅ Dashboard set to **{project_name}**. It will auto-update.", ephemeral=True)
 
 @bot.tree.command(name="admin_deposit", description="👮 Give items TO another user's inventory")
@@ -405,27 +415,30 @@ async def admin_deposit(interaction: discord.Interaction, target_user: discord.M
         return
 
     async with pool.acquire() as conn:
-        # 1. Ensure item exists
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+        # 1. Get or Create ID
+        item_id = await conn.fetchval("""
+            INSERT INTO items (name) VALUES ($1) 
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+            RETURNING id
+        """, item_name)
         
-        # 2. Add to TARGET USER'S stock (using target_user.id)
+        # 2. Add to TARGET USER'S stock (using ID)
         await conn.execute("""
-            INSERT INTO user_inventory (user_id, item_name, quantity)
+            INSERT INTO user_inventory (user_id, item_id, quantity)
             VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, item_name) 
+            ON CONFLICT (user_id, item_id) 
             DO UPDATE SET quantity = user_inventory.quantity + $3, last_updated = NOW()
-        """, target_user.id, item_name, amount)
+        """, target_user.id, item_id, amount)
         
-        # 3. Get new personal total for that user
+        # 3. Get new personal total
         new_personal = await conn.fetchval(
-            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
-            target_user.id, item_name
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_id = $2", 
+            target_user.id, item_id
         )
         
         # 4. Get Global Total
-        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", item_name)
+        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_id = $1", item_id)
 
-    # 5. Public Announcement
     await interaction.response.send_message(
         f"👮 **Admin Action:** Deposited **{amount}** {item_name} into {target_user.mention}'s stash.\n"
         f"👤 **Their Total:** {new_personal}\n"
@@ -443,11 +456,17 @@ async def admin_withdraw(interaction: discord.Interaction, target_user: discord.
         return
 
     async with pool.acquire() as conn:
-        # 1. Check target's current balance
+        # 1. Lookup ID (Strict lookup, don't create)
+        item_id = await conn.fetchval("SELECT id FROM items WHERE name = $1", item_name)
+        if not item_id:
+            await interaction.response.send_message(f"❌ Item **{item_name}** not found in database.", ephemeral=True)
+            return
+
+        # 2. Check target's current balance
         current_qty = await conn.fetchval("""
             SELECT quantity FROM user_inventory 
-            WHERE user_id = $1 AND item_name = $2
-        """, target_user.id, item_name)
+            WHERE user_id = $1 AND item_id = $2
+        """, target_user.id, item_id)
         
         if current_qty is None or current_qty < amount:
             await interaction.response.send_message(
@@ -456,17 +475,17 @@ async def admin_withdraw(interaction: discord.Interaction, target_user: discord.
             )
             return
 
-        # 2. Perform withdrawal
+        # 3. Perform withdrawal
         new_personal = current_qty - amount
         if new_personal == 0:
-            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", target_user.id, item_name)
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_id = $2", target_user.id, item_id)
         else:
             await conn.execute("""
                 UPDATE user_inventory SET quantity = $3, last_updated = NOW()
-                WHERE user_id = $1 AND item_name = $2
-            """, target_user.id, item_name, new_personal)
+                WHERE user_id = $1 AND item_id = $2
+            """, target_user.id, item_id, new_personal)
             
-        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", item_name) or 0
+        global_total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_id = $1", item_id) or 0
 
     await interaction.response.send_message(
         f"👮 **Admin Action:** Withdrew **{amount}** {item_name} from {target_user.mention}.\n"
@@ -485,26 +504,30 @@ async def deposit_item(interaction: discord.Interaction, item_name: str, amount:
         return
 
     async with pool.acquire() as conn:
-        # 1. Ensure item exists in DB registry
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+        # 1. Get or Create ID
+        item_id = await conn.fetchval("""
+            INSERT INTO items (name) VALUES ($1) 
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+            RETURNING id
+        """, item_name)
         
-        # 2. Add to existing quantity (Upsert)
+        # 2. Upsert using ID
         await conn.execute("""
-            INSERT INTO user_inventory (user_id, item_name, quantity)
+            INSERT INTO user_inventory (user_id, item_id, quantity)
             VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, item_name) 
+            ON CONFLICT (user_id, item_id) 
             DO UPDATE SET quantity = user_inventory.quantity + $3, last_updated = NOW()
-        """, interaction.user.id, item_name, amount)
+        """, interaction.user.id, item_id, amount)
         
-        # 3. Get new total for confirmation
+        # 3. Get new total
         new_total = await conn.fetchval(
-            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
-            interaction.user.id, item_name
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_id = $2", 
+            interaction.user.id, item_id
         )
 
         global_total = await conn.fetchval(
-            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
-            item_name
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_id = $1", 
+            item_id
         )
 
     await interaction.response.send_message(
@@ -522,11 +545,17 @@ async def withdraw_item(interaction: discord.Interaction, item_name: str, amount
         return
 
     async with pool.acquire() as conn:
-        # 1. Check current balance
+        # 1. Lookup ID
+        item_id = await conn.fetchval("SELECT id FROM items WHERE name = $1", item_name)
+        if not item_id:
+            await interaction.response.send_message(f"❌ You don't have any **{item_name}**.", ephemeral=True)
+            return
+
+        # 2. Check current balance
         current_qty = await conn.fetchval("""
             SELECT quantity FROM user_inventory 
-            WHERE user_id = $1 AND item_name = $2
-        """, interaction.user.id, item_name)
+            WHERE user_id = $1 AND item_id = $2
+        """, interaction.user.id, item_id)
         
         if current_qty is None or current_qty < amount:
             await interaction.response.send_message(
@@ -535,24 +564,23 @@ async def withdraw_item(interaction: discord.Interaction, item_name: str, amount
             )
             return
 
-        # 2. Perform withdrawal
+        # 3. Perform withdrawal
         new_total = current_qty - amount
         if new_total == 0:
-            # Optional: Delete row if 0 to keep DB clean, or just set to 0
-            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", interaction.user.id, item_name)
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_id = $2", interaction.user.id, item_id)
         else:
             await conn.execute("""
                 UPDATE user_inventory SET quantity = $3, last_updated = NOW()
-                WHERE user_id = $1 AND item_name = $2
-            """, interaction.user.id, item_name, new_total)
+                WHERE user_id = $1 AND item_id = $2
+            """, interaction.user.id, item_id, new_total)
 
         global_total = await conn.fetchval(
-            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
-            item_name
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_id = $1", 
+            item_id
         )
 
     await interaction.response.send_message(
-        f"� **{interaction.user.display_name}** withdrew **{amount}** {item_name}.\n"
+        f"📉 **{interaction.user.display_name}** withdrew **{amount}** {item_name}.\n"
         f"📦 **{interaction.user.display_name}** Total stock: **{new_total}**.\n"
         f"🌍 **Global Stock:** {global_total}"
     )
@@ -566,33 +594,35 @@ async def modify_item_qty(interaction: discord.Interaction, item_name: str, quan
         return
 
     async with pool.acquire() as conn:
-        # 1. Ensure item exists
-        await conn.execute("INSERT INTO items (name) VALUES ($1) ON CONFLICT DO NOTHING", item_name)
+        # 1. Get or Create ID
+        item_id = await conn.fetchval("""
+            INSERT INTO items (name) VALUES ($1) 
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name 
+            RETURNING id
+        """, item_name)
 
         initial_total = await conn.fetchval(
-            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_name = $2", 
-            interaction.user.id, item_name
+            "SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_id = $2", 
+            interaction.user.id, item_id
         )
 
         if quantity == 0:
-            # If setting to 0, just delete the row
-            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_name = $2", interaction.user.id, item_name)
+            await conn.execute("DELETE FROM user_inventory WHERE user_id = $1 AND item_id = $2", interaction.user.id, item_id)
         else:
-            # Upsert (Overwrite mode)
             await conn.execute("""
-                INSERT INTO user_inventory (user_id, item_name, quantity)
+                INSERT INTO user_inventory (user_id, item_id, quantity)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (user_id, item_name) 
+                ON CONFLICT (user_id, item_id) 
                 DO UPDATE SET quantity = $3, last_updated = NOW()
-            """, interaction.user.id, item_name, quantity)
+            """, interaction.user.id, item_id, quantity)
 
         global_total = await conn.fetchval(
-            "SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", 
-            item_name
+            "SELECT SUM(quantity) FROM user_inventory WHERE item_id = $1", 
+            item_id
         )
 
     await interaction.response.send_message(
-        f"� **{interaction.user.display_name}** ✏️ Updated **{item_name}** from **{initial_total}** to **{quantity}**.\n"
+        f"✏️ **{interaction.user.display_name}** Updated **{item_name}** from **{initial_total}** to **{quantity}**.\n"
         f"🌍 **Global Stock:** {global_total}"
     )
     await update_dashboard_message(interaction.guild)
@@ -604,7 +634,14 @@ async def update_stock(interaction: discord.Interaction):
 @bot.tree.command(name="my_stock", description="View your personal inventory")
 async def my_stock(interaction: discord.Interaction):
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT item_name, quantity FROM user_inventory WHERE user_id = $1 AND quantity > 0 ORDER BY item_name", interaction.user.id)
+        # JOIN items to retrieve name
+        rows = await conn.fetch("""
+            SELECT i.name as item_name, ui.quantity 
+            FROM user_inventory ui
+            JOIN items i ON ui.item_id = i.id
+            WHERE ui.user_id = $1 AND ui.quantity > 0 
+            ORDER BY i.name
+        """, interaction.user.id)
     
     if not rows:
         await interaction.response.send_message("You have no items registered. Use `/update_stock`!", ephemeral=True)
@@ -618,11 +655,13 @@ async def my_stock(interaction: discord.Interaction):
 @bot.tree.command(name="my_stock_export", description="Get your current inventory in copy-paste format")
 async def my_stock_export(interaction: discord.Interaction):
     async with pool.acquire() as conn:
+        # JOIN items to retrieve name
         rows = await conn.fetch("""
-            SELECT item_name, quantity 
-            FROM user_inventory 
-            WHERE user_id = $1 AND quantity > 0 
-            ORDER BY item_name
+            SELECT i.name as item_name, ui.quantity 
+            FROM user_inventory ui
+            JOIN items i ON ui.item_id = i.id
+            WHERE ui.user_id = $1 AND ui.quantity > 0 
+            ORDER BY i.name
         """, interaction.user.id)
     
     if not rows:
@@ -640,19 +679,27 @@ async def my_stock_export(interaction: discord.Interaction):
     await interaction.followup.send(f"```{export_text}```", ephemeral=True)
 
 # --- COMMANDS: LOGISTICS & OFFICERS (PUBLIC) ---
-# Note: Locate/Production/Status are public info, but you can protect them if you wish.
-# Currently they are open to everyone.
 
 @bot.tree.command(name="locate", description="Find who is holding a specific item")
 @app_commands.autocomplete(item_name=item_autocomplete)
 async def locate(interaction: discord.Interaction, item_name: str):
     async with pool.acquire() as conn:
+        # JOIN items to filter by name
         rows = await conn.fetch("""
-            SELECT user_id, quantity FROM user_inventory 
-            WHERE item_name = $1 AND quantity > 0 
-            ORDER BY quantity DESC LIMIT 10
+            SELECT ui.user_id, ui.quantity 
+            FROM user_inventory ui
+            JOIN items i ON ui.item_id = i.id
+            WHERE i.name = $1 AND ui.quantity > 0 
+            ORDER BY ui.quantity DESC LIMIT 10
         """, item_name)
-        total = await conn.fetchval("SELECT SUM(quantity) FROM user_inventory WHERE item_name = $1", item_name) or 0
+        
+        # Lookup total by name via JOIN
+        total = await conn.fetchval("""
+            SELECT SUM(ui.quantity) 
+            FROM user_inventory ui
+            JOIN items i ON ui.item_id = i.id
+            WHERE i.name = $1
+        """, item_name) or 0
 
     if not rows:
         await interaction.response.send_message(f"❌ No one has **{item_name}**.", ephemeral=True)
@@ -681,7 +728,15 @@ async def locate(interaction: discord.Interaction, item_name: str):
 @app_commands.autocomplete(item_name=item_autocomplete)
 async def production(interaction: discord.Interaction, item_name: str):
     async with pool.acquire() as conn:
-        recipe = await conn.fetchrow("SELECT * FROM recipes WHERE output_item_name = $1", item_name)
+        # Join items to find input item Name and Ratio
+        recipe = await conn.fetchrow("""
+            SELECT input_i.name as input_item_name, r.quantity_required
+            FROM recipes r
+            JOIN items output_i ON r.output_item_id = output_i.id
+            JOIN items input_i ON r.input_item_id = input_i.id
+            WHERE output_i.name = $1
+        """, item_name)
+        
         if not recipe:
             await interaction.response.send_message(f"⚠️ **{item_name}** has no recipe registered.", ephemeral=True)
             return
@@ -689,10 +744,13 @@ async def production(interaction: discord.Interaction, item_name: str):
         input_item = recipe['input_item_name']
         ratio = recipe['quantity_required']
         
+        # Check holders of the input item
         holders = await conn.fetch("""
-            SELECT user_id, quantity FROM user_inventory 
-            WHERE item_name = $1 AND quantity >= $2
-            ORDER BY quantity DESC LIMIT 10
+            SELECT ui.user_id, ui.quantity 
+            FROM user_inventory ui
+            JOIN items i ON ui.item_id = i.id
+            WHERE i.name = $1 AND ui.quantity >= $2
+            ORDER BY ui.quantity DESC LIMIT 10
         """, input_item, ratio)
     
     embed = discord.Embed(title=f"🏭 Production Chain: {item_name}", color=discord.Color.orange())
@@ -723,8 +781,6 @@ async def status(interaction: discord.Interaction, project_name: str):
         await interaction.followup.send(embed=embed)
     else:
         await interaction.followup.send(f"❌ Project **{project_name}** not found or empty.")
-
-# --- HELP COMMAND ---
 
 # --- HELP COMMAND ---
 
@@ -763,11 +819,12 @@ async def help_command(interaction: discord.Interaction):
 
 async def build_dashboard_embed(project_name):
     async with pool.acquire() as conn:
-        # 1. Fetch all requirements for this project
+        # 1. Fetch all requirements using JOINs
         reqs = await conn.fetch("""
-            SELECT pr.item_name, pr.target_amount 
+            SELECT i.name as item_name, pr.target_amount 
             FROM project_requirements pr
             JOIN projects p ON pr.project_id = p.id
+            JOIN items i ON pr.item_id = i.id
             WHERE p.name = $1
         """, project_name)
         
@@ -779,18 +836,29 @@ async def build_dashboard_embed(project_name):
         embed = discord.Embed(title=f"🚀 Project Status: {project_name}", color=discord.Color.blue())
         
         # Track the project bottleneck (Lowest number of sets we can make)
-        # Start with None (infinity)
         min_project_sets = None
 
         for req in reqs:
             item = req['item_name']
             target = req['target_amount']
             
-            # Get Direct Stock (Finished items)
-            direct = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", item)
+            # Get Direct Stock using JOIN
+            direct = await conn.fetchval("""
+                SELECT COALESCE(SUM(ui.quantity), 0) 
+                FROM user_inventory ui
+                JOIN items i ON ui.item_id = i.id
+                WHERE i.name = $1
+            """, item)
             
-            # Get Potential Stock (Calculated from Surplus Ingredients)
-            recipe = await conn.fetchrow("SELECT input_item_name, quantity_required FROM recipes WHERE output_item_name = $1", item)
+            # Get Recipe info (Input Item Name + Ratio) using JOINs
+            recipe = await conn.fetchrow("""
+                SELECT input_i.name as input_item_name, r.quantity_required
+                FROM recipes r
+                JOIN items output_i ON r.output_item_id = output_i.id
+                JOIN items input_i ON r.input_item_id = input_i.id
+                WHERE output_i.name = $1
+            """, item)
+            
             potential = 0
             input_item_name = None
             
@@ -799,7 +867,12 @@ async def build_dashboard_embed(project_name):
                 ratio = recipe['quantity_required']
                 
                 # A. How much of the raw material do we have TOTAL?
-                raw_total = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
+                raw_total = await conn.fetchval("""
+                    SELECT COALESCE(SUM(ui.quantity), 0) 
+                    FROM user_inventory ui
+                    JOIN items i ON ui.item_id = i.id
+                    WHERE i.name = $1
+                """, input_item_name)
                 
                 # B. Does the project ITSELF need this raw material directly?
                 raw_needed_directly = requirements_map.get(input_item_name, 0)
@@ -815,7 +888,6 @@ async def build_dashboard_embed(project_name):
             percent = min(100, int((total_ready / target) * 100))
 
             # --- Calculate Sets for this Item ---
-            # e.g., if we have 500 Scrap and need 50, we have 10 sets of Scrap.
             if target > 0:
                 current_item_sets = total_ready // target
                 if min_project_sets is None or current_item_sets < min_project_sets:
@@ -835,7 +907,13 @@ async def build_dashboard_embed(project_name):
             if potential > 0:
                 status_text += f"• **Potential:** +{potential} (Craftable from {surplus_raw} excess {input_item_name})\n"
             elif recipe and potential == 0:
-                 raw_total_debug = await conn.fetchval("SELECT COALESCE(SUM(quantity), 0) FROM user_inventory WHERE item_name = $1", input_item_name)
+                 raw_total_debug = await conn.fetchval("""
+                    SELECT COALESCE(SUM(ui.quantity), 0) 
+                    FROM user_inventory ui
+                    JOIN items i ON ui.item_id = i.id
+                    WHERE i.name = $1
+                 """, input_item_name)
+                 
                  if raw_total_debug > 0:
                      status_text += f"• *Raw materials reserved for other requirements*\n"
 
