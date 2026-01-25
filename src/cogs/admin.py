@@ -4,6 +4,34 @@ from discord import app_commands
 from src.utils import is_officer, project_autocomplete, item_autocomplete, build_dashboard_embed, update_dashboard_message
 from src.ui.modals import ProjectRequirementModal, WipeConfirmModal
 
+# --- DEPENDENT AUTOCOMPLETE FUNCTION ---
+async def admin_item_autocomplete(interaction: discord.Interaction, current: str):
+    """
+    If 'target_user' is selected, show ONLY their items.
+    Otherwise, show ALL items.
+    """
+    # 1. Check if the user filled in the 'target_user' field
+    target_user = interaction.namespace.target_user
+    
+    user_id = None
+    if target_user:
+        # Discord usually returns an Object or Member, usually having an .id attribute
+        if hasattr(target_user, 'id'):
+            user_id = target_user.id
+        elif isinstance(target_user, int):
+            user_id = target_user
+
+    # 2. Decide which DB query to run
+    if user_id:
+        # Specific User Search
+        records = await interaction.client.db.get_user_items_autocomplete(user_id, current)
+    else:
+        # Global Search (Default)
+        records = await interaction.client.db.item_autocomplete(current)
+    
+    return [app_commands.Choice(name=r['name'], value=r['name']) for r in records]
+
+
 class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -27,30 +55,25 @@ class Admin(commands.Cog):
         except ValueError:
             await interaction.response.send_message(f"❌ Project **{project_name}** not found.", ephemeral=True)
 
-    # --- 🟢 RESTORED MISSING COMMAND ---
     @app_commands.command(name="project_item_export", description="Get a copy-paste list of current project requirements")
     @app_commands.autocomplete(project_name=project_autocomplete)
     @is_officer()
     async def project_item_export(self, interaction: discord.Interaction, project_name: str):
-        # 1. Fetch requirements
         rows = await self.bot.db.get_project_requirements(project_name)
 
         if not rows:
             await interaction.response.send_message(f"⚠️ Project **{project_name}** has no requirements yet.", ephemeral=True)
             return
 
-        # 2. Format specifically for the Bulk Edit modal
         export_text = ""
         for row in rows:
             export_text += f"{row['item_name']}: {row['target_amount']}\n"
         
-        # 3. Send inside a code block for easy copying
         await interaction.response.send_message(
             f"📋 **Export for {project_name}:**\nCopy the block below used in `/project_item_bulk_edit`", 
             ephemeral=True
         )
         await interaction.followup.send(f"```{export_text}```", ephemeral=True)
-    # -----------------------------------
 
     @app_commands.command(name="project_item_bulk_edit", description="Bulk update/overwrite project requirements")
     @is_officer()
@@ -89,8 +112,6 @@ class Admin(commands.Cog):
 
         await self.bot.db.update_user_stock(target_user.id, item_name, amount)
         
-        # We need to fetch the new totals manually for the message
-        # (This logic is slightly different from the generic helper, but uses basic DB calls)
         item_id = await self.bot.db.get_item_id_by_name(item_name)
         async with self.bot.db.pool.acquire() as conn:
              new_personal = await conn.fetchval("SELECT quantity FROM user_inventory WHERE user_id = $1 AND item_id = $2", target_user.id, item_id)
@@ -106,7 +127,8 @@ class Admin(commands.Cog):
 
     @app_commands.command(name="admin_withdraw", description="Remove items FROM another user")
     @app_commands.describe(target_user="Who loses the items?", item_name="Which item?", amount="How many?")
-    @app_commands.autocomplete(item_name=item_autocomplete)
+    # 🔴 CHANGED: Now uses dependent autocomplete
+    @app_commands.autocomplete(item_name=admin_item_autocomplete) 
     @is_officer()
     async def admin_withdraw(self, interaction: discord.Interaction, target_user: discord.Member, item_name: str, amount: int):
         if amount <= 0: return await interaction.response.send_message("❌ Positive amounts only.", ephemeral=True)

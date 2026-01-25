@@ -127,7 +127,19 @@ class DatabaseManager:
     async def item_autocomplete(self, current: str):
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT name FROM items WHERE name ILIKE $1 LIMIT 25", f"%{current}%")
-
+        
+    async def get_user_items_autocomplete(self, user_id: int, current: str):
+        """Finds items ONLY in a specific user's inventory."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("""
+                SELECT i.name 
+                FROM user_inventory ui
+                JOIN items i ON ui.item_id = i.id
+                WHERE ui.user_id = $1 AND ui.quantity > 0 AND i.name ILIKE $2
+                ORDER BY i.name ASC
+                LIMIT 25
+            """, user_id, f"%{current}%")
+        
     # --- PROJECTS & RECIPES ---
     async def create_project(self, name: str):
         async with self.pool.acquire() as conn:

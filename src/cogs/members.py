@@ -4,6 +4,15 @@ from discord import app_commands
 from src.utils import item_autocomplete, update_dashboard_message
 from src.ui.modals import InventoryModal
 
+# --- CUSTOM AUTOCOMPLETE ---
+async def withdraw_autocomplete(interaction: discord.Interaction, current: str):
+    """
+    Shows ONLY items that the user currently has in their inventory.
+    """
+    # interaction.client is the bot instance
+    records = await interaction.client.db.get_user_items_autocomplete(interaction.user.id, current)
+    return [app_commands.Choice(name=r['name'], value=r['name']) for r in records]
+
 class Members(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -97,7 +106,7 @@ class Members(commands.Cog):
         await update_dashboard_message(interaction)
 
     @app_commands.command(name="withdraw_item", description="Remove items from your stash (e.g. -50 Scrap)")
-    @app_commands.autocomplete(item_name=item_autocomplete)
+    @app_commands.autocomplete(item_name=withdraw_autocomplete)
     async def withdraw_item(self, interaction: discord.Interaction, item_name: str, amount: int):
         if amount <= 0: 
             await interaction.response.send_message("❌ Amount must be positive.", ephemeral=True)
